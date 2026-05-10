@@ -1,0 +1,19 @@
+{
+  "name": "MeshDrop",
+  "short_name": "MeshDrop",
+  "description": "Mensagens locais P2P via WebRTC sem backend.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#101828",
+  "theme_color": "#101828",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

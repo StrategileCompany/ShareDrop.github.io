@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#101828">
+    <meta name="description" content="Mensagens locais peer-to-peer via WebRTC, sem servidor.">
+    <link rel="manifest" href="./manifest.json">
+    <link rel="stylesheet" href="./styles.css">
+    <title>MeshDrop</title>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand" aria-label="MeshDrop">
+          <span class="brand-mark">M</span>
+          <div>
+            <strong>MeshDrop</strong>
+            <small>WebRTC local, sem servidor</small>
+          </div>
+        </div>
+        <div class="top-actions">
+          <button class="icon-button" id="installButton" type="button" title="Instalar app" hidden>↓</button>
+          <button class="icon-button" id="settingsButton" type="button" title="Editar dispositivo">⚙</button>
+        </div>
+      </header>
+
+      <main>
+        <section class="hero-panel" aria-labelledby="deviceTitle">
+          <div>
+            <p class="eyebrow">Dispositivo atual</p>
+            <h1 id="deviceTitle">Pronto para parear</h1>
+            <p id="deviceSubtitle">Defina seu nome e conecte outro dispositivo por QR Code ou SDP manual.</p>
+          </div>
+          <div class="status-pill" id="connectionStatus">offline</div>
+        </section>
+
+        <section class="setup-card" id="setupPanel">
+          <label for="deviceNameInput">Nome amigável</label>
+          <div class="name-row">
+            <input id="deviceNameInput" maxlength="40" autocomplete="nickname" placeholder="Ex.: Notebook da Ana">
+            <button id="saveNameButton" type="button">Entrar</button>
+          </div>
+        </section>
+
+        <section class="action-grid" aria-label="Ações de pareamento">
+          <button class="action-card" id="createOfferButton" type="button">
+            <span class="action-icon">◎</span>
+            <strong>Gerar QR</strong>
+            <small>Criar convite WebRTC</small>
+          </button>
+          <button class="action-card" id="scanButton" type="button">
+            <span class="action-icon">▣</span>
+            <strong>Escanear</strong>
+            <small>Ler convite ou resposta</small>
+          </button>
+          <button class="action-card" id="pasteButton" type="button">
+            <span class="action-icon">⧉</span>
+            <strong>Colar SDP</strong>
+            <small>Fluxo manual offline</small>
+          </button>
+        </section>
+
+        <section class="content-grid">
+          <article class="panel peers-panel">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Presença</p>
+                <h2>Dispositivos online</h2>
+              </div>
+              <span id="peerCount">0</span>
+            </div>
+            <div class="peer-grid" id="peerGrid" aria-live="polite"></div>
+          </article>
+
+          <article class="panel chat-panel">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Mensagens</p>
+                <h2>Conversa local</h2>
+              </div>
+              <button class="ghost-button" id="clearHistoryButton" type="button">Limpar</button>
+            </div>
+            <div class="message-list" id="messageList" aria-live="polite"></div>
+            <form class="composer" id="messageForm">
+              <select id="recipientSelect" aria-label="Destinatário">
+                <option value="all">Todos</option>
+              </select>
+              <input id="messageInput" maxlength="1200" placeholder="Escreva uma mensagem..." autocomplete="off">
+              <button id="sendButton" type="submit">Enviar</button>
+            </form>
+          </article>
+        </section>
+      </main>
+    </div>
+
+    <dialog class="modal" id="pairDialog">
+      <form method="dialog" class="modal-card">
+        <div class="modal-header">
+          <div>
+            <p class="eyebrow" id="pairDialogEyebrow">Pareamento</p>
+            <h2 id="pairDialogTitle">Conectar dispositivo</h2>
+          </div>
+          <button class="icon-button" value="cancel" type="submit" title="Fechar">×</button>
+        </div>
+        <div id="pairDialogBody"></div>
+      </form>
+    </dialog>
+
+    <template id="qrTemplate">
+      <div class="qr-layout">
+        <canvas class="qr-canvas" width="360" height="360" aria-label="QR Code de pareamento"></canvas>
+        <div class="qr-side">
+          <div class="progress-line"><span></span></div>
+          <p class="muted qrStatus">Preparando QR...</p>
+          <textarea class="manualPayload" readonly spellcheck="false"></textarea>
+          <div class="button-row">
+            <button class="copyPayloadButton" type="button">Copiar SDP</button>
+            <button class="stopQrButton secondary" type="button">Parar</button>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <template id="scanTemplate">
+      <div class="scan-layout">
+        <video class="scanner-video" autoplay playsinline muted></video>
+        <p class="muted scanStatus">Aponte para todos os QR Codes do pareamento.</p>
+        <div class="button-row">
+          <button class="stopScanButton secondary" type="button">Parar câmera</button>
+        </div>
+      </div>
+    </template>
+
+    <template id="pasteTemplate">
+      <div class="paste-layout">
+        <textarea class="pastePayload" spellcheck="false" placeholder="Cole aqui o SDP/QRCode copiado..."></textarea>
+        <div class="button-row">
+          <button class="readClipboardButton secondary" type="button">Ler clipboard</button>
+          <button class="processPayloadButton" type="button">Processar</button>
+        </div>
+      </div>
+    </template>
+
+    <div class="toast-stack" id="toastStack" aria-live="polite"></div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
