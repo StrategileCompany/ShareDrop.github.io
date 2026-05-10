@@ -1,609 +1,502 @@
-const RTC_CONFIG = {
-  iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
-};
-const PROTOCOL = "meshdrop-webrtc-v1";
+const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
 const HEARTBEAT_INTERVAL = 5000;
 const PEER_TIMEOUT = 16000;
-const MESSAGE_TTL = 8;
 
-export class PeerNetwork extends EventTarget {
-  constructor({ peerId, name, storage }) {
+export const MESSAGE_TYPES = {
+  HELLO: "hello",
+  PEER_LIST: "peer-list",
+  HEARTBEAT: "heartbeat",
+  MESSAGE: "message",
+  PRIVATE_MESSAGE: "private-message",
+  PEER_DISCONNECT: "peer-disconnect",
+  MESH_SIGNAL: "mesh-signal"
+};
+
+export class WebRTCManager extends EventTarget {
+  constructor({ peerId, getName }) {
     super();
-    this.localPeer = { id: peerId, name };
-    this.storage = storage;
-    this.sessions = new Map();
-    this.pendingOffers = new Map();
-    this.autoAttempts = new Set();
+    this.peerId = peerId;
+    this.getName = getName;
     this.peers = new Map();
-    this.seenMessages = new Set();
-    this.heartbeatTimer = window.setInterval(() => this.tick(), HEARTBEAT_INTERVAL);
+    this.pendingOffers = new Map();
+    this.pendingAnswers = new Map();
+    this.heartbeatTimer = window.setInterval(() => this.heartbeat(), HEARTBEAT_INTERVAL);
   }
 
-  setName(name) {
-    this.localPeer.name = name;
-    this.broadcastHello();
+  get connectedPeers() {
+    return [...this.peers.values()].map((peer) => this.serializePeer(peer));
+  }
+
+  serializePeer(peer) {
+    return {
+      id: peer.id,
+      name: peer.name || "Dispositivo",
+      status: peer.status,
+      latency: peer.latency || null,
+      lastSeen: peer.lastSeen || Date.now(),
+      direct: peer.channel?.readyState === "open"
+    };
   }
 
   async createOffer() {
-    const offerId = crypto.randomUUID();
-    const session = this.createSession({ remoteId: null, offerId, role: "offerer" });
-    const channel = session.pc.createDataChannel("meshdrop", { ordered: true });
-    this.attachChannel(session, channel);
-    const offer = await session.pc.createOffer();
-    await session.pc.setLocalDescription(offer);
-    await waitForIceGathering(session.pc);
-    this.pendingOffers.set(offerId, session);
-    await this.storage?.saveSession?.({ id: offerId, mode: "offer", createdAt: Date.now() });
-    return {
-      protocol: PROTOCOL,
-      mode: "offer",
-      id: offerId,
-      peer: this.publicPeer(),
-      sdp: session.pc.localDescription
-    };
+    const sessionId = crypto.randomUUID();
+    const connection = this.createPeerConnection(null, sessionId, true);
+    const channel = connection.createDataChannel("sharedrop", { ordered: true });
+    this.prepareDataChannel(channel, null, sessionId);
+    const offer = await connection.createOffer();
+    await connection.setLocalDescription(offer);
+    await this.waitForIceGathering(connection);
+    this.pendingOffers.set(sessionId, connection);
+    this.emit("log", "Convite SDP criado.");
+    return this.makeSignal("offer", sessionId, connection.localDescription);
   }
 
   async acceptOffer(payload) {
-    this.assertPayload(payload, "offer");
-    const remotePeer = payload.peer;
-    const session = this.createSession({ remoteId: remotePeer.id, offerId: payload.id, role: "answerer" });
-    this.rememberPeer(remotePeer, { connected: false, state: "connecting" });
-    session.pc.ondatachannel = event => this.attachChannel(session, event.channel);
-    await session.pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-    const answer = await session.pc.createAnswer();
-    await session.pc.setLocalDescription(answer);
-    await waitForIceGathering(session.pc);
-    await this.storage?.saveSession?.({ id: payload.id, mode: "answer", remoteId: remotePeer.id, createdAt: Date.now() });
-    return {
-      protocol: PROTOCOL,
-      mode: "answer",
-      replyTo: payload.id,
-      peer: this.publicPeer(),
-      sdp: session.pc.localDescription
+    this.ensureSignal(payload, "offer");
+    const connection = this.createPeerConnection(payload.from.id, payload.sessionId, false);
+    connection.ondatachannel = (event) => {
+      this.prepareDataChannel(event.channel, payload.from.id, payload.sessionId);
     };
+    await connection.setRemoteDescription(payload.sdp);
+    const answer = await connection.createAnswer();
+    await connection.setLocalDescription(answer);
+    await this.waitForIceGathering(connection);
+    this.pendingAnswers.set(payload.sessionId, connection);
+    this.upsertPeer(payload.from, { connection, status: "connecting" });
+    this.emit("log", `Resposta SDP criada para ${payload.from.name}.`);
+    return this.makeSignal("answer", payload.sessionId, connection.localDescription, payload.from.id);
   }
 
   async acceptAnswer(payload) {
-    this.assertPayload(payload, "answer");
-    const session = this.pendingOffers.get(payload.replyTo);
-    if (!session) {
-      throw new Error("Resposta recebida para um convite desconhecido ou já usado.");
+    this.ensureSignal(payload, "answer");
+    const connection = this.pendingOffers.get(payload.sessionId);
+    if (!connection) {
+      throw new Error("Não encontrei o convite original para essa resposta.");
     }
-    session.remoteId = payload.peer.id;
-    this.pendingOffers.delete(payload.replyTo);
-    this.sessions.delete(session.key);
-    session.key = payload.peer.id;
-    this.sessions.set(session.key, session);
-    this.rememberPeer(payload.peer, { connected: false, state: "connecting" });
-    await session.pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-    this.dispatchPeers();
+    await connection.setRemoteDescription(payload.sdp);
+    this.pendingOffers.delete(payload.sessionId);
+    this.emit("log", `Resposta SDP aplicada de ${payload.from.name}.`);
   }
 
-  sendChat({ to = "all", text }) {
-    const trimmed = text.trim();
-    if (!trimmed) {
-      return;
+  async processSignal(rawSignal) {
+    const payload = decodeSignal(rawSignal);
+    if (payload.from?.id === this.peerId) {
+      throw new Error("Esse SDP foi gerado por este próprio dispositivo.");
     }
-    const envelope = {
-      id: crypto.randomUUID(),
-      type: to === "all" ? "message" : "private-message",
-      from: this.localPeer.id,
-      to,
-      text: trimmed,
-      timestamp: Date.now(),
-      ttl: MESSAGE_TTL
-    };
-    this.recordMessage(envelope, true);
-    this.forward(envelope);
-  }
-
-  broadcastHello() {
-    this.forward({
-      id: crypto.randomUUID(),
-      type: "hello",
-      from: this.localPeer.id,
-      peer: this.publicPeer(),
-      timestamp: Date.now(),
-      ttl: MESSAGE_TTL
-    });
-    this.broadcastPeerList();
-  }
-
-  broadcastPeerList() {
-    this.forward({
-      id: crypto.randomUUID(),
-      type: "peer-list",
-      from: this.localPeer.id,
-      peers: [this.publicPeer(), ...this.getPeers()],
-      timestamp: Date.now(),
-      ttl: MESSAGE_TTL
-    });
-  }
-
-  getPeers() {
-    const now = Date.now();
-    return Array.from(this.peers.values())
-      .map(peer => ({
-        ...peer,
-        connected: this.isDirectlyConnected(peer.id),
-        stale: now - (peer.lastSeen ?? 0) > PEER_TIMEOUT
-      }))
-      .sort((a, b) => Number(b.connected) - Number(a.connected) || a.name.localeCompare(b.name));
-  }
-
-  close() {
-    window.clearInterval(this.heartbeatTimer);
-    for (const session of this.sessions.values()) {
-      this.notifyDisconnect(session.remoteId);
-      session.channel?.close();
-      session.pc.close();
+    if (payload.kind === "offer") return this.acceptOffer(payload);
+    if (payload.kind === "answer") {
+      await this.acceptAnswer(payload);
+      return null;
     }
+    throw new Error("Tipo de SDP desconhecido.");
   }
 
-  createSession({ remoteId, offerId, role }) {
-    const pc = new RTCPeerConnection(RTC_CONFIG);
-    const key = remoteId ?? `pending:${offerId}`;
-    const session = {
-      key,
-      remoteId,
-      offerId,
-      role,
-      pc,
-      channel: null,
-      state: "connecting",
-      retryCount: 0,
-      pendingPings: new Map()
-    };
-    pc.onconnectionstatechange = () => this.updateSessionState(session);
-    pc.oniceconnectionstatechange = () => this.updateSessionState(session);
-    this.sessions.set(key, session);
-    return session;
+  createPeerConnection(remoteId, sessionId, polite) {
+    const connection = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    connection.__sessionId = sessionId;
+    connection.__remoteId = remoteId;
+    connection.__polite = polite;
+    connection.onconnectionstatechange = () => this.handleConnectionState(connection);
+    connection.oniceconnectionstatechange = () => this.handleConnectionState(connection);
+    return connection;
   }
 
-  attachChannel(session, channel) {
-    session.channel = channel;
+  prepareDataChannel(channel, remoteId, sessionId) {
+    channel.binaryType = "arraybuffer";
     channel.onopen = () => {
-      session.state = "connected";
-      session.retryCount = 0;
-      this.sendToSession(session, {
-        id: crypto.randomUUID(),
-        type: "hello",
-        from: this.localPeer.id,
-        peer: this.publicPeer(),
-        timestamp: Date.now(),
-        ttl: MESSAGE_TTL
+      const peer = this.findPeer(remoteId, sessionId);
+      peer.channel = channel;
+      peer.status = "online";
+      peer.lastSeen = Date.now();
+      this.sendTo(peer.id, {
+        type: MESSAGE_TYPES.HELLO,
+        from: this.peerId,
+        to: peer.id,
+        name: this.getName(),
+        timestamp: Date.now()
       });
-      this.sendPeerListTo(session);
-      this.dispatchStatus();
+      this.broadcastPeerList();
+      this.emitPeers();
+      this.emit("log", `Canal aberto com ${peer.name || peer.id.slice(0, 8)}.`);
     };
-    channel.onmessage = event => this.handleRawMessage(event.data, session);
-    channel.onclose = () => this.handleSessionClosed(session);
-    channel.onerror = () => this.handleSessionClosed(session);
+    channel.onmessage = (event) => this.handleMessage(event.data, remoteId, sessionId);
+    channel.onclose = () => this.markChannelClosed(remoteId, sessionId, "canal fechado");
+    channel.onerror = () => this.markChannelClosed(remoteId, sessionId, "erro no canal");
   }
 
-  handleRawMessage(data, session) {
-    let envelope;
+  findPeer(remoteId, sessionId) {
+    if (remoteId && this.peers.has(remoteId)) return this.peers.get(remoteId);
+    const match = [...this.peers.values()].find((peer) => peer.connection?.__sessionId === sessionId);
+    if (match) return match;
+    const id = remoteId || `pending-${sessionId}`;
+    return this.upsertPeer({ id, name: "Pareando" }, { status: "connecting" });
+  }
+
+  upsertPeer(identity, extra = {}) {
+    if (!identity?.id || identity.id === this.peerId) return null;
+    const existing = this.peers.get(identity.id) || {};
+    const peer = {
+      ...existing,
+      ...extra,
+      id: identity.id,
+      name: identity.name || existing.name || "Dispositivo",
+      status: extra.status || existing.status || "known",
+      lastSeen: Date.now()
+    };
+    if (existing.id?.startsWith("pending-") && existing.id !== identity.id) {
+      this.peers.delete(existing.id);
+    }
+    this.peers.set(peer.id, peer);
+    this.emitPeers();
+    return peer;
+  }
+
+  peerForSession(remoteId, sessionId) {
+    if (remoteId && this.peers.has(remoteId)) return this.peers.get(remoteId);
+    return [...this.peers.values()].find((peer) => peer.connection?.__sessionId === sessionId);
+  }
+
+  rekeyPendingPeer(oldId, identity, sessionId) {
+    if (oldId === identity.id) return this.upsertPeer(identity);
+    const pending = this.peers.get(oldId) || [...this.peers.values()].find((peer) => peer.connection?.__sessionId === sessionId);
+    if (pending) this.peers.delete(pending.id);
+    if (pending?.connection) pending.connection.__remoteId = identity.id;
+    return this.upsertPeer(identity, pending || {});
+  }
+
+  handleMessage(raw, remoteId, sessionId) {
+    let message;
     try {
-      envelope = JSON.parse(data);
+      message = JSON.parse(raw);
     } catch {
       return;
     }
-    if (!envelope || envelope.from === this.localPeer.id) {
-      return;
+    if (!message?.type || message.from === this.peerId) return;
+
+    const peer = this.rekeyPendingPeer(remoteId || message.from, {
+      id: message.from,
+      name: message.name || this.peers.get(message.from)?.name || "Dispositivo"
+    }, sessionId);
+    if (peer) {
+      peer.lastSeen = Date.now();
+      peer.status = "online";
     }
-    if (envelope.peer) {
-      this.rememberPeer(envelope.peer, { connected: this.isDirectlyConnected(envelope.peer.id), state: "online" });
-      if (!session.remoteId) {
-        this.promoteSession(session, envelope.peer.id);
-      }
-    }
-    if (envelope.type === "heartbeat") {
-      this.handleHeartbeat(envelope, session);
-      return;
-    }
-    if (envelope.id && this.seenMessages.has(envelope.id)) {
-      return;
-    }
-    if (envelope.id) {
-      this.markSeen(envelope.id);
-    }
-    switch (envelope.type) {
-      case "hello":
-        this.sendPeerListTo(session);
-        this.dispatchPeers();
+
+    switch (message.type) {
+      case MESSAGE_TYPES.HELLO:
+        this.sendTo(message.from, {
+          type: MESSAGE_TYPES.PEER_LIST,
+          from: this.peerId,
+          to: message.from,
+          peers: this.localPeerList(),
+          timestamp: Date.now()
+        });
+        this.broadcastPeerList();
         break;
-      case "peer-list":
-        this.handlePeerList(envelope);
-        this.forward(envelope, session);
+      case MESSAGE_TYPES.PEER_LIST:
+        this.learnPeerList(message.peers || [], message.from);
         break;
-      case "mesh-offer":
-        if (envelope.to === this.localPeer.id) {
-          this.acceptMeshOffer(envelope);
-        } else {
-          this.forward(envelope, session);
-        }
+      case MESSAGE_TYPES.HEARTBEAT:
+        this.handleHeartbeat(message, peer);
         break;
-      case "mesh-answer":
-        if (envelope.to === this.localPeer.id) {
-          this.acceptMeshAnswer(envelope);
-        } else {
-          this.forward(envelope, session);
-        }
+      case MESSAGE_TYPES.MESSAGE:
+      case MESSAGE_TYPES.PRIVATE_MESSAGE:
+        this.emit("message", message);
+        this.relayIfNeeded(message);
         break;
-      case "message":
-        this.recordMessage(envelope, false);
-        this.forward(envelope, session);
+      case MESSAGE_TYPES.PEER_DISCONNECT:
+        this.markDisconnected(message.from, "peer saiu");
+        this.relayIfNeeded(message);
         break;
-      case "private-message":
-        if (envelope.to === this.localPeer.id) {
-          this.recordMessage(envelope, false);
-        } else {
-          this.forward(envelope, session);
-        }
-        break;
-      case "peer-disconnect":
-        this.markPeerOffline(envelope.from);
-        this.forward(envelope, session);
+      case MESSAGE_TYPES.MESH_SIGNAL:
+        this.handleMeshSignal(message);
         break;
       default:
         break;
     }
+    this.emitPeers();
   }
 
-  handlePeerList(envelope) {
-    for (const peer of envelope.peers ?? []) {
-      if (!peer.id || peer.id === this.localPeer.id) {
-        continue;
-      }
-      this.rememberPeer(peer, {
-        connected: this.isDirectlyConnected(peer.id),
-        state: peer.connected ? "online" : "seen"
-      });
-      this.maybeAutoConnect(peer.id);
-    }
-    this.dispatchPeers();
-  }
-
-  async maybeAutoConnect(remoteId) {
-    if (!remoteId || remoteId === this.localPeer.id || this.isDirectlyConnected(remoteId) || this.sessionForPeer(remoteId)) {
+  handleHeartbeat(message, peer) {
+    if (message.replyTo && peer) {
+      peer.latency = Math.max(1, Date.now() - message.replyTo);
       return;
     }
-    if (this.localPeer.id > remoteId || this.autoAttempts.has(remoteId)) {
+    this.sendTo(message.from, {
+      type: MESSAGE_TYPES.HEARTBEAT,
+      from: this.peerId,
+      to: message.from,
+      timestamp: Date.now(),
+      replyTo: message.timestamp
+    });
+  }
+
+  learnPeerList(peers, via) {
+    let changed = false;
+    for (const peer of peers) {
+      if (!peer?.id || peer.id === this.peerId) continue;
+      const existing = this.peers.get(peer.id);
+      if (!existing) {
+        this.upsertPeer(peer, { status: peer.direct ? "online" : "known", via });
+        changed = true;
+      } else if (peer.name && existing.name !== peer.name) {
+        existing.name = peer.name;
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.broadcastPeerList();
+      this.emitPeers();
+    }
+  }
+
+  async handleMeshSignal(message) {
+    if (message.to !== this.peerId) {
+      this.forward(message);
       return;
     }
-    this.autoAttempts.add(remoteId);
     try {
-      const offerId = `mesh-${crypto.randomUUID()}`;
-      const session = this.createSession({ remoteId, offerId, role: "mesh-offer" });
-      const channel = session.pc.createDataChannel("meshdrop", { ordered: true });
-      this.attachChannel(session, channel);
-      const offer = await session.pc.createOffer();
-      await session.pc.setLocalDescription(offer);
-      await waitForIceGathering(session.pc);
-      this.pendingOffers.set(offerId, session);
-      this.forward({
-        id: offerId,
-        type: "mesh-offer",
-        from: this.localPeer.id,
-        to: remoteId,
-        peer: this.publicPeer(),
-        sdp: session.pc.localDescription,
-        timestamp: Date.now(),
-        ttl: MESSAGE_TTL
-      });
-    } catch {
-      this.autoAttempts.delete(remoteId);
-    }
-  }
-
-  async acceptMeshOffer(envelope) {
-    try {
-      const remotePeer = envelope.peer;
-      if (!remotePeer?.id || this.isDirectlyConnected(remotePeer.id)) {
-        return;
+      if (message.signal?.kind === "offer") {
+        const answer = await this.acceptOffer(message.signal);
+        this.forward({
+          type: MESSAGE_TYPES.MESH_SIGNAL,
+          from: this.peerId,
+          to: message.from,
+          signal: answer,
+          timestamp: Date.now()
+        });
+      } else if (message.signal?.kind === "answer") {
+        await this.acceptAnswer(message.signal);
       }
-      const session = this.createSession({ remoteId: remotePeer.id, offerId: envelope.id, role: "mesh-answer" });
-      this.rememberPeer(remotePeer, { connected: false, state: "connecting" });
-      session.pc.ondatachannel = event => this.attachChannel(session, event.channel);
-      await session.pc.setRemoteDescription(new RTCSessionDescription(envelope.sdp));
-      const answer = await session.pc.createAnswer();
-      await session.pc.setLocalDescription(answer);
-      await waitForIceGathering(session.pc);
+    } catch (error) {
+      this.emit("log", error.message);
+    }
+  }
+
+  requestMesh(peerId) {
+    const peer = this.peers.get(peerId);
+    if (!peer || peer.channel?.readyState === "open") return;
+    return this.createOffer().then((signal) => {
+      signal.to = peerId;
       this.forward({
-        id: crypto.randomUUID(),
-        type: "mesh-answer",
-        from: this.localPeer.id,
-        to: remotePeer.id,
-        replyTo: envelope.id,
-        peer: this.publicPeer(),
-        sdp: session.pc.localDescription,
-        timestamp: Date.now(),
-        ttl: MESSAGE_TTL
-      });
-    } catch {
-      this.markPeerOffline(envelope.from);
-    }
-  }
-
-  async acceptMeshAnswer(envelope) {
-    try {
-      const session = this.pendingOffers.get(envelope.replyTo);
-      if (!session) {
-        return;
-      }
-      session.remoteId = envelope.peer.id;
-      this.pendingOffers.delete(envelope.replyTo);
-      await session.pc.setRemoteDescription(new RTCSessionDescription(envelope.sdp));
-      this.rememberPeer(envelope.peer, { connected: false, state: "connecting" });
-    } catch {
-      this.markPeerOffline(envelope.from);
-    }
-  }
-
-  handleHeartbeat(envelope, session) {
-    if (envelope.kind === "ping") {
-      this.sendToSession(session, {
-        type: "heartbeat",
-        kind: "pong",
-        from: this.localPeer.id,
-        to: envelope.from,
-        replyTo: envelope.nonce,
+        type: MESSAGE_TYPES.MESH_SIGNAL,
+        from: this.peerId,
+        to: peerId,
+        signal,
         timestamp: Date.now()
       });
-      return;
-    }
-    if (envelope.kind === "pong" && envelope.replyTo) {
-      const sentAt = session.pendingPings.get(envelope.replyTo);
-      if (sentAt) {
-        session.pendingPings.delete(envelope.replyTo);
-        const latency = Date.now() - sentAt;
-        if (session.remoteId) {
-          this.rememberPeer({ id: session.remoteId }, { latency, connected: true, state: "online" });
-        }
-      }
-    }
-  }
-
-  forward(envelope, exceptSession = null) {
-    const ttl = envelope.ttl ?? MESSAGE_TTL;
-    if (ttl <= 0) {
-      return;
-    }
-    const next = { ...envelope, ttl: ttl - 1 };
-    const direct = envelope.to && envelope.to !== "all" ? this.sessionForPeer(envelope.to) : null;
-    if (direct && direct !== exceptSession && this.isOpen(direct.channel)) {
-      this.sendToSession(direct, next);
-      return;
-    }
-    for (const session of this.sessions.values()) {
-      if (session === exceptSession || !this.isOpen(session.channel)) {
-        continue;
-      }
-      this.sendToSession(session, next);
-    }
-  }
-
-  sendPeerListTo(session) {
-    this.sendToSession(session, {
-      id: crypto.randomUUID(),
-      type: "peer-list",
-      from: this.localPeer.id,
-      peers: [this.publicPeer(), ...this.getPeers()],
-      timestamp: Date.now(),
-      ttl: MESSAGE_TTL
     });
   }
 
-  sendToSession(session, payload) {
-    if (!this.isOpen(session.channel)) {
-      return false;
-    }
-    session.channel.send(JSON.stringify(payload));
-    return true;
-  }
-
-  tick() {
-    const now = Date.now();
-    for (const session of this.sessions.values()) {
-      if (!this.isOpen(session.channel)) {
-        this.maybeRetry(session);
-        continue;
-      }
-      const nonce = crypto.randomUUID();
-      session.pendingPings.set(nonce, now);
-      this.sendToSession(session, {
-        type: "heartbeat",
-        kind: "ping",
-        nonce,
-        from: this.localPeer.id,
-        timestamp: now
-      });
-    }
-    for (const peer of this.peers.values()) {
-      if (peer.connected && now - (peer.lastSeen ?? 0) > PEER_TIMEOUT) {
-        peer.connected = false;
-        peer.state = "stale";
-      }
-    }
-    this.dispatchPeers();
-    this.dispatchStatus();
-  }
-
-  updateSessionState(session) {
-    const state = session.pc.connectionState || session.pc.iceConnectionState;
-    session.state = state;
-    if (session.remoteId) {
-      this.rememberPeer({ id: session.remoteId }, {
-        connected: state === "connected",
-        state,
-        lastSeen: Date.now()
-      });
-    }
-    if (["disconnected", "failed"].includes(state)) {
-      this.maybeRetry(session);
-    }
-    this.dispatchStatus();
-  }
-
-  maybeRetry(session) {
-    if (session.retryCount >= 3 || session.pc.signalingState === "closed") {
-      if (session.remoteId) {
-        this.markPeerOffline(session.remoteId);
-      }
-      return;
-    }
-    session.retryCount += 1;
-    try {
-      session.pc.restartIce?.();
-    } catch {
-      // restartIce is best-effort; disconnected peers can always be paired again manually.
-    }
-  }
-
-  handleSessionClosed(session) {
-    session.state = "closed";
-    if (session.remoteId) {
-      this.markPeerOffline(session.remoteId);
-    }
-    this.dispatchStatus();
-  }
-
-  promoteSession(session, remoteId) {
-    this.sessions.delete(session.key);
-    session.remoteId = remoteId;
-    session.key = remoteId;
-    this.sessions.set(remoteId, session);
-  }
-
-  sessionForPeer(peerId) {
-    return this.sessions.get(peerId) ?? Array.from(this.sessions.values()).find(session => session.remoteId === peerId);
-  }
-
-  rememberPeer(peer, patch = {}) {
-    const existing = this.peers.get(peer.id) ?? {};
-    const next = {
-      ...existing,
-      ...peer,
-      ...patch,
-      id: peer.id,
-      name: peer.name ?? existing.name ?? peer.id.slice(0, 6),
-      lastSeen: patch.lastSeen ?? Date.now()
-    };
-    this.peers.set(next.id, next);
-    this.storage?.savePeer?.(next);
-    this.dispatchPeers();
-  }
-
-  markPeerOffline(peerId) {
-    const peer = this.peers.get(peerId);
-    if (!peer) {
-      return;
-    }
-    peer.connected = false;
-    peer.state = "offline";
-    peer.lastSeen = Date.now();
-    this.dispatchPeers();
-  }
-
-  notifyDisconnect(peerId) {
-    if (!peerId) {
-      return;
-    }
-    this.forward({
-      id: crypto.randomUUID(),
-      type: "peer-disconnect",
-      from: this.localPeer.id,
-      to: "all",
-      peerId,
-      timestamp: Date.now(),
-      ttl: MESSAGE_TTL
-    });
-  }
-
-  recordMessage(envelope, own) {
+  sendMessage(text, to = "all") {
+    const type = to === "all" ? MESSAGE_TYPES.MESSAGE : MESSAGE_TYPES.PRIVATE_MESSAGE;
     const message = {
-      id: envelope.id ?? crypto.randomUUID(),
-      type: envelope.type,
-      from: envelope.from,
-      to: envelope.to,
-      text: envelope.text,
-      timestamp: envelope.timestamp ?? Date.now(),
-      private: envelope.type === "private-message",
-      own
+      type,
+      from: this.peerId,
+      to,
+      text,
+      timestamp: Date.now()
     };
-    this.storage?.saveMessage?.(message);
-    this.dispatchEvent(new CustomEvent("message", { detail: message }));
+    if (to === "all") {
+      this.broadcast(message);
+    } else {
+      this.sendTo(to, message) || this.forward(message);
+    }
+    return message;
   }
 
-  publicPeer() {
+  broadcast(message) {
+    for (const peer of this.peers.values()) {
+      if (peer.channel?.readyState === "open") {
+        peer.channel.send(JSON.stringify(message));
+      }
+    }
+  }
+
+  sendTo(peerId, message) {
+    const peer = this.peers.get(peerId);
+    if (peer?.channel?.readyState === "open") {
+      peer.channel.send(JSON.stringify(message));
+      return true;
+    }
+    return false;
+  }
+
+  forward(message) {
+    const payload = JSON.stringify(message);
+    for (const peer of this.peers.values()) {
+      if (peer.channel?.readyState === "open" && peer.id !== message.from) {
+        peer.channel.send(payload);
+      }
+    }
+  }
+
+  relayIfNeeded(message) {
+    if (message.to === "all") {
+      this.forward(message);
+    } else if (message.to !== this.peerId) {
+      this.sendTo(message.to, message) || this.forward(message);
+    }
+  }
+
+  localPeerList() {
+    return [
+      {
+        id: this.peerId,
+        name: this.getName(),
+        status: "online",
+        direct: true,
+        lastSeen: Date.now()
+      },
+      ...this.connectedPeers
+    ];
+  }
+
+  broadcastPeerList() {
+    this.broadcast({
+      type: MESSAGE_TYPES.PEER_LIST,
+      from: this.peerId,
+      to: "all",
+      peers: this.localPeerList(),
+      timestamp: Date.now()
+    });
+  }
+
+  heartbeat() {
+    const now = Date.now();
+    for (const peer of this.peers.values()) {
+      if (peer.channel?.readyState === "open") {
+        this.sendTo(peer.id, {
+          type: MESSAGE_TYPES.HEARTBEAT,
+          from: this.peerId,
+          to: peer.id,
+          timestamp: now
+        });
+      }
+      if (peer.status === "online" && now - (peer.lastSeen || 0) > PEER_TIMEOUT) {
+        peer.status = "stale";
+      }
+      if (["known", "stale", "offline"].includes(peer.status) && this.hasOpenRoute(peer.id) && (!peer.lastMeshAttempt || now - peer.lastMeshAttempt > 12000)) {
+        peer.lastMeshAttempt = now;
+        this.requestMesh(peer.id);
+      }
+    }
+    this.emitPeers();
+  }
+
+  hasOpenRoute(exceptPeerId) {
+    return [...this.peers.values()].some((peer) => peer.id !== exceptPeerId && peer.channel?.readyState === "open");
+  }
+
+  markChannelClosed(remoteId, sessionId, reason) {
+    const peer = this.peerForSession(remoteId, sessionId);
+    if (peer) this.markDisconnected(peer.id, reason);
+  }
+
+  markDisconnected(peerId, reason) {
+    if (!peerId) return;
+    const peer = this.peers.get(peerId);
+    if (!peer) return;
+    peer.status = "offline";
+    peer.lastSeen = Date.now();
+    this.emit("log", `${peer.name || peerId.slice(0, 8)} desconectado: ${reason}.`);
+    this.broadcast({
+      type: MESSAGE_TYPES.PEER_DISCONNECT,
+      from: peerId,
+      to: "all",
+      timestamp: Date.now()
+    });
+    this.emitPeers();
+  }
+
+  handleConnectionState(connection) {
+    const peer = [...this.peers.values()].find((item) => item.connection === connection);
+    if (!peer) return;
+    const state = connection.connectionState || connection.iceConnectionState;
+    if (["failed", "disconnected", "closed"].includes(state)) {
+      this.markDisconnected(peer.id, state);
+    } else if (["connected", "completed"].includes(state)) {
+      peer.status = "online";
+      peer.lastSeen = Date.now();
+      this.emitPeers();
+    }
+  }
+
+  waitForIceGathering(connection) {
+    if (connection.iceGatheringState === "complete") return Promise.resolve();
+    return new Promise((resolve) => {
+      const timeout = window.setTimeout(resolve, 4200);
+      connection.addEventListener("icegatheringstatechange", () => {
+        if (connection.iceGatheringState === "complete") {
+          window.clearTimeout(timeout);
+          resolve();
+        }
+      });
+    });
+  }
+
+  makeSignal(kind, sessionId, sdp, to = null) {
     return {
-      id: this.localPeer.id,
-      name: this.localPeer.name,
-      lastSeen: Date.now(),
-      connected: true
+      app: "sharedrop",
+      version: 1,
+      kind,
+      sessionId,
+      from: {
+        id: this.peerId,
+        name: this.getName()
+      },
+      to,
+      sdp: {
+        type: sdp.type,
+        sdp: sdp.sdp
+      },
+      timestamp: Date.now()
     };
   }
 
-  isOpen(channel) {
-    return channel?.readyState === "open";
-  }
-
-  isDirectlyConnected(peerId) {
-    return this.isOpen(this.sessionForPeer(peerId)?.channel);
-  }
-
-  dispatchPeers() {
-    this.dispatchEvent(new CustomEvent("peers", { detail: this.getPeers() }));
-  }
-
-  dispatchStatus() {
-    const direct = Array.from(this.sessions.values()).filter(session => this.isOpen(session.channel)).length;
-    this.dispatchEvent(new CustomEvent("status", {
-      detail: {
-        direct,
-        total: this.peers.size,
-        online: direct > 0
-      }
-    }));
-  }
-
-  markSeen(id) {
-    this.seenMessages.add(id);
-    if (this.seenMessages.size > 800) {
-      const first = this.seenMessages.values().next().value;
-      this.seenMessages.delete(first);
+  ensureSignal(payload, kind) {
+    if (!payload || payload.app !== "sharedrop" || payload.kind !== kind || !payload.sdp) {
+      throw new Error(`SDP ${kind} inválido.`);
     }
   }
 
-  assertPayload(payload, mode) {
-    if (payload?.protocol !== PROTOCOL || payload.mode !== mode || !payload.peer?.id || !payload.sdp) {
-      throw new Error("SDP incompatível com este app.");
+  disconnect() {
+    this.broadcast({
+      type: MESSAGE_TYPES.PEER_DISCONNECT,
+      from: this.peerId,
+      to: "all",
+      timestamp: Date.now()
+    });
+    window.clearInterval(this.heartbeatTimer);
+    for (const peer of this.peers.values()) {
+      peer.channel?.close();
+      peer.connection?.close();
     }
+  }
+
+  emit(type, detail) {
+    this.dispatchEvent(new CustomEvent(type, { detail }));
+  }
+
+  emitPeers() {
+    this.emit("peers", this.connectedPeers);
   }
 }
 
-export function createPeerId() {
-  const bytes = new Uint8Array(5);
-  crypto.getRandomValues(bytes);
-  return `peer-${Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("")}`;
+export function encodeSignal(signal) {
+  return btoa(unescape(encodeURIComponent(JSON.stringify(signal))));
 }
 
-async function waitForIceGathering(pc) {
-  if (pc.iceGatheringState === "complete") {
-    return;
+export function decodeSignal(rawSignal) {
+  const clean = String(rawSignal || "").trim();
+  if (!clean) throw new Error("Cole ou escaneie um SDP primeiro.");
+  try {
+    return JSON.parse(clean);
+  } catch {
+    try {
+      return JSON.parse(decodeURIComponent(escape(atob(clean))));
+    } catch {
+      throw new Error("Não consegui ler esse SDP.");
+    }
   }
-  await new Promise(resolve => {
-    const timeout = window.setTimeout(done, 4200);
-    function done() {
-      window.clearTimeout(timeout);
-      pc.removeEventListener("icegatheringstatechange", onChange);
-      resolve();
-    }
-    function onChange() {
-      if (pc.iceGatheringState === "complete") {
-        done();
-      }
-    }
-    pc.addEventListener("icegatheringstatechange", onChange);
-  });
 }

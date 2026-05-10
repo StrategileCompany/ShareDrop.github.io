@@ -3,146 +3,144 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-    <meta name="theme-color" content="#101828">
-    <meta name="description" content="Mensagens locais peer-to-peer via WebRTC, sem servidor.">
+    <meta name="theme-color" content="#0f172a">
+    <meta name="description" content="Sharedrop serverless para mensagens locais via WebRTC.">
+    <title>sharedrop</title>
     <link rel="manifest" href="./manifest.json">
     <link rel="stylesheet" href="./styles.css">
-    <title>MeshDrop</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128'%3E%3Crect width='128' height='128' rx='28' fill='%230f172a'/%3E%3Cpath fill='%236ee7b7' d='M37 69a27 27 0 0 1 54-2h-13a14 14 0 1 0-14 16h37v13H64a27 27 0 0 1-27-27Z'/%3E%3Ccircle cx='64' cy='64' r='9' fill='%23f8fafc'/%3E%3C/svg%3E">
   </head>
   <body>
     <div class="app-shell">
       <header class="topbar">
-        <div class="brand" aria-label="MeshDrop">
-          <span class="brand-mark">M</span>
-          <div>
-            <strong>MeshDrop</strong>
-            <small>WebRTC local, sem servidor</small>
-          </div>
-        </div>
-        <div class="top-actions">
-          <button class="icon-button" id="installButton" type="button" title="Instalar app" hidden>↓</button>
-          <button class="icon-button" id="settingsButton" type="button" title="Editar dispositivo">⚙</button>
+        <a class="brand" href="./" aria-label="sharedrop">
+          <span class="brand-mark">s</span>
+          <span>sharedrop</span>
+        </a>
+        <div class="status-pill" id="networkStatus">
+          <span class="pulse"></span>
+          <span>offline pronto</span>
         </div>
       </header>
 
-      <main>
-        <section class="hero-panel" aria-labelledby="deviceTitle">
-          <div>
-            <p class="eyebrow">Dispositivo atual</p>
-            <h1 id="deviceTitle">Pronto para parear</h1>
-            <p id="deviceSubtitle">Defina seu nome e conecte outro dispositivo por QR Code ou SDP manual.</p>
-          </div>
-          <div class="status-pill" id="connectionStatus">offline</div>
-        </section>
-
-        <section class="setup-card" id="setupPanel">
-          <label for="deviceNameInput">Nome amigável</label>
-          <div class="name-row">
-            <input id="deviceNameInput" maxlength="40" autocomplete="nickname" placeholder="Ex.: Notebook da Ana">
-            <button id="saveNameButton" type="button">Entrar</button>
-          </div>
-        </section>
-
-        <section class="action-grid" aria-label="Ações de pareamento">
-          <button class="action-card" id="createOfferButton" type="button">
-            <span class="action-icon">◎</span>
-            <strong>Gerar QR</strong>
-            <small>Criar convite WebRTC</small>
-          </button>
-          <button class="action-card" id="scanButton" type="button">
-            <span class="action-icon">▣</span>
-            <strong>Escanear</strong>
-            <small>Ler convite ou resposta</small>
-          </button>
-          <button class="action-card" id="pasteButton" type="button">
-            <span class="action-icon">⧉</span>
-            <strong>Colar SDP</strong>
-            <small>Fluxo manual offline</small>
-          </button>
-        </section>
-
-        <section class="content-grid">
-          <article class="panel peers-panel">
-            <div class="section-heading">
-              <div>
-                <p class="eyebrow">Presença</p>
-                <h2>Dispositivos online</h2>
-              </div>
-              <span id="peerCount">0</span>
+      <main class="layout">
+        <section class="hero-panel">
+          <div class="identity-card">
+            <div>
+              <p class="eyebrow">dispositivo</p>
+              <h1 id="deviceTitle">Novo dispositivo</h1>
+              <p class="muted" id="peerIdLabel">ID temporário</p>
             </div>
-            <div class="peer-grid" id="peerGrid" aria-live="polite"></div>
-          </article>
+            <button class="icon-button" id="editNameButton" type="button" title="Editar nome" aria-label="Editar nome">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+            </button>
+          </div>
 
-          <article class="panel chat-panel">
-            <div class="section-heading">
-              <div>
-                <p class="eyebrow">Mensagens</p>
-                <h2>Conversa local</h2>
-              </div>
-              <button class="ghost-button" id="clearHistoryButton" type="button">Limpar</button>
+          <div class="install-card" id="installCard" hidden>
+            <div>
+              <strong>Instalar PWA</strong>
+              <span>Abra em tela cheia e use offline depois do primeiro carregamento.</span>
             </div>
-            <div class="message-list" id="messageList" aria-live="polite"></div>
-            <form class="composer" id="messageForm">
-              <select id="recipientSelect" aria-label="Destinatário">
-                <option value="all">Todos</option>
-              </select>
-              <input id="messageInput" maxlength="1200" placeholder="Escreva uma mensagem..." autocomplete="off">
-              <button id="sendButton" type="submit">Enviar</button>
-            </form>
-          </article>
+            <button class="primary small" id="installButton" type="button">Instalar</button>
+          </div>
+
+          <div class="peers-header">
+            <div>
+              <p class="eyebrow">online</p>
+              <h2>Dispositivos próximos</h2>
+            </div>
+            <button class="ghost small" id="broadcastFocusButton" type="button">Broadcast</button>
+          </div>
+          <div class="peer-grid" id="peerGrid" aria-live="polite"></div>
+        </section>
+
+        <section class="workspace">
+          <div class="composer">
+            <label class="field-label" for="recipientSelect">Destino</label>
+            <select id="recipientSelect">
+              <option value="all">Todos os dispositivos</option>
+            </select>
+
+            <label class="field-label" for="messageInput">Mensagem</label>
+            <div class="message-box">
+              <textarea id="messageInput" rows="3" placeholder="Escreva uma mensagem para a rede local"></textarea>
+              <button class="primary send-button" id="sendButton" type="button">
+                <span>Enviar</span>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>
+              </button>
+            </div>
+          </div>
+
+          <div class="messages-panel">
+            <div class="section-title">
+              <h2>Mensagens</h2>
+              <button class="icon-button" id="clearHistoryButton" type="button" title="Limpar histórico" aria-label="Limpar histórico">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="m19 6-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+              </button>
+            </div>
+            <div class="message-list" id="messageList"></div>
+          </div>
+        </section>
+
+        <section class="pairing-panel">
+          <div class="section-title">
+            <div>
+              <p class="eyebrow">pareamento</p>
+              <h2>Conectar sem servidor</h2>
+            </div>
+          </div>
+
+          <div class="pairing-actions">
+            <button class="primary" id="createOfferButton" type="button">Gerar convite</button>
+            <button class="ghost" id="scanButton" type="button">Escanear QR</button>
+          </div>
+
+          <div class="qr-box" id="qrBox" hidden>
+            <img id="qrImage" alt="QRCode de pareamento">
+            <div>
+              <p class="qr-title" id="qrTitle">QRCode</p>
+              <p class="muted" id="qrHint">Compartilhe com outro dispositivo.</p>
+            </div>
+          </div>
+
+          <label class="field-label" for="signalTextarea">SDP Offer/Answer</label>
+          <textarea class="signal-area" id="signalTextarea" rows="8" spellcheck="false" placeholder="Cole aqui um convite ou resposta SDP"></textarea>
+
+          <div class="pairing-actions">
+            <button class="ghost" id="copySignalButton" type="button">Copiar</button>
+            <button class="ghost" id="pasteSignalButton" type="button">Colar</button>
+            <button class="primary" id="processSignalButton" type="button">Processar</button>
+          </div>
+
+          <div class="camera-panel" id="cameraPanel" hidden>
+            <video id="cameraVideo" playsinline muted></video>
+            <button class="ghost small" id="stopScanButton" type="button">Parar câmera</button>
+          </div>
+
+          <div class="log-panel">
+            <div class="section-title compact">
+              <h3>Estado</h3>
+            </div>
+            <ul id="connectionLog"></ul>
+          </div>
         </section>
       </main>
     </div>
 
-    <dialog class="modal" id="pairDialog">
-      <form method="dialog" class="modal-card">
-        <div class="modal-header">
-          <div>
-            <p class="eyebrow" id="pairDialogEyebrow">Pareamento</p>
-            <h2 id="pairDialogTitle">Conectar dispositivo</h2>
-          </div>
-          <button class="icon-button" value="cancel" type="submit" title="Fechar">×</button>
+    <dialog id="nameDialog">
+      <form method="dialog" class="dialog-card">
+        <h2>Nome do dispositivo</h2>
+        <p class="muted">Esse nome aparece para os outros peers durante o pareamento.</p>
+        <input id="deviceNameInput" type="text" maxlength="32" autocomplete="nickname" placeholder="Notebook da sala">
+        <div class="dialog-actions">
+          <button class="ghost" value="cancel" type="submit">Cancelar</button>
+          <button class="primary" id="saveNameButton" value="default" type="submit">Salvar</button>
         </div>
-        <div id="pairDialogBody"></div>
       </form>
     </dialog>
 
-    <template id="qrTemplate">
-      <div class="qr-layout">
-        <canvas class="qr-canvas" width="360" height="360" aria-label="QR Code de pareamento"></canvas>
-        <div class="qr-side">
-          <div class="progress-line"><span></span></div>
-          <p class="muted qrStatus">Preparando QR...</p>
-          <textarea class="manualPayload" readonly spellcheck="false"></textarea>
-          <div class="button-row">
-            <button class="copyPayloadButton" type="button">Copiar SDP</button>
-            <button class="stopQrButton secondary" type="button">Parar</button>
-          </div>
-        </div>
-      </div>
-    </template>
-
-    <template id="scanTemplate">
-      <div class="scan-layout">
-        <video class="scanner-video" autoplay playsinline muted></video>
-        <p class="muted scanStatus">Aponte para todos os QR Codes do pareamento.</p>
-        <div class="button-row">
-          <button class="stopScanButton secondary" type="button">Parar câmera</button>
-        </div>
-      </div>
-    </template>
-
-    <template id="pasteTemplate">
-      <div class="paste-layout">
-        <textarea class="pastePayload" spellcheck="false" placeholder="Cole aqui o SDP/QRCode copiado..."></textarea>
-        <div class="button-row">
-          <button class="readClipboardButton secondary" type="button">Ler clipboard</button>
-          <button class="processPayloadButton" type="button">Processar</button>
-        </div>
-      </div>
-    </template>
-
     <div class="toast-stack" id="toastStack" aria-live="polite"></div>
+
     <script type="module" src="./app.js"></script>
   </body>
 </html>
